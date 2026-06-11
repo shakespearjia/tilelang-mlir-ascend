@@ -24,6 +24,9 @@ FIXED_ROTARY_DIM_DIVISOR = 4
 FIXED_DTYPE = torch.bfloat16
 REL_TOL = 0.10
 
+# complement test case grid here
+case_grid = [16, 64, 4, 8, 128]
+
 
 @tilelang.jit(target="npuir")
 def mamba_mimo_fwd(
@@ -412,8 +415,12 @@ def mamba_mimo_fwd(
                 if i == nchunks - 1 and return_final_state:
                     seq_boundary = T.min(chunk_start + chunk_size, S) - chunk_start
                     last_step = seq_boundary - 1
-                    for r, n in T.Parallel(R, N):
-                        FINAL_K[i_b, r, i_h, n] = k_shared[last_step * R + r, n]
+                    # for r, n in T.Parallel(R, N):
+                    #     FINAL_K[i_b, r, i_h, n] = k_shared[last_step * R + r, n]
+                    T.copy(
+                        k_shared[last_step * R : last_step * R + R, :],
+                        FINAL_K[i_b, :, i_h, :],
+                    )
 
                 k_trap_scaled_frag = T.alloc_fragment(
                     [fused_chunk_size, N], accum_dtype
@@ -571,7 +578,7 @@ def mamba_mimo_fwd(
                     )
                 else:
                     if hasZ:
-                        z_frag = T.alloc_fragment([chunk_size, P], accum_dtype)
+                        z_frag = T.alloc_fragment([chunk_size, 1, P], accum_dtype)
                         T.copy(
                             Z[i_b, chunk_start : chunk_start + chunk_size, i_h, :],
                             z_frag,
@@ -598,10 +605,21 @@ def mamba_mimo_fwd(
                         lqk_PsiV_reshaped_shared = T.alloc_shared(
                             [chunk_size, R, P], accum_dtype
                         )
-                        for cs, r, p in T.Parallel(chunk_size, R, P):
-                            lqk_PsiV_reshaped_shared[cs, r, p] = (
-                                o_mimo_accum_frag[cs * R + r, p]
-                                * z_expanded_frag[cs, r, p]
+                        # for cs, r, p in T.Parallel(chunk_size, R, P):
+                        #     lqk_PsiV_reshaped_shared[cs, r, p] = (
+                        #         o_mimo_accum_frag[cs * R + r, p]
+                        #         * z_expanded_frag[cs, r, p]
+                        #     )
+                        accum_frag_tmp = T.alloc_fragment([1, R, P], accum_dtype)
+                        for cs in T.serial(chunk_size):
+                            T.copy(
+                                o_mimo_accum_frag[cs * R : cs * R + R, :],
+                                accum_frag_tmp[0, :, :],
+                            )
+                            T.vmul(
+                                accum_frag_tmp,
+                                z_expanded_frag[cs, :, :],
+                                lqk_PsiV_reshaped_shared[cs, :, :],
                             )
 
                         T.copy(
@@ -612,10 +630,15 @@ def mamba_mimo_fwd(
                         lqk_PsiV_reshaped_shared = T.alloc_shared(
                             [chunk_size, R, P], accum_dtype
                         )
-                        for cs, r, p in T.Parallel(chunk_size, R, P):
-                            lqk_PsiV_reshaped_shared[cs, r, p] = o_mimo_accum_frag[
-                                cs * R + r, p
-                            ]
+                        # for cs, r, p in T.Parallel(chunk_size, R, P):
+                        #     lqk_PsiV_reshaped_shared[cs, r, p] = o_mimo_accum_frag[
+                        #         cs * R + r, p
+                        #     ]
+                        for cs in T.serial(chunk_size):
+                            T.copy(
+                                o_mimo_accum_frag[cs * R : cs * R + R, :],
+                                lqk_PsiV_reshaped_shared[cs, :, :],
+                            )
                         T.copy(
                             lqk_PsiV_reshaped_shared,
                             O[i_b, chunk_start : chunk_start + chunk_size, :, i_h, :],
@@ -1121,9 +1144,6 @@ def build_inputs(
     }
 
 
-case_grid = [16, 64, 4, 8, 128]
-
-
 def assert_stable_rel(
     ours: Tensor,
     ref: Tensor,
@@ -1161,14 +1181,7 @@ def assert_stable_rel(
     )
 
 
-def run_test():
-    os.environ["TILELANG_ASCEND_MODE"] = "Dev"
-    tilelang.cache.clear_cache()
-
-    n = case_grid[0]
-    p = case_grid[1]
-    r = case_grid[2]
-    chunk_size = case_grid[3]
+def test_mimo_fwd_reduceO(n: int, p: int, r: int, chunk_size: int):
 
     inputs = build_inputs(
         n=n,
@@ -1238,7 +1251,7 @@ def run_test():
         return_final_state=True,
     )
 
-    print(f"N={n}, P={p}, R={r}, chunk={chunk_size}")
+    print(f"Test mamba3 mimo fwd reduceO: N={n}, P={p}, R={r}, chunk={chunk_size}")
     out_tilelang = out_tilelang.float().cpu()
 
     assert_stable_rel(
@@ -1248,8 +1261,92 @@ def run_test():
         cfg=f"N={n}, P={p}, R={r}, chunk={chunk_size}",
     )
 
-    print("Test passed!")
+
+def test_mimo_fwd(n: int, p: int, r: int, chunk_size: int):
+    # not reduceO test, mimo_o is None
+    inputs = build_inputs(
+        n=n,
+        p=p,
+        r=r,
+        chunk_size=chunk_size,
+        seed=42,
+    )
+
+    out_tilelang, _, _ = mamba_mimo_forward(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["q_bias"],
+        inputs["k_bias"],
+        inputs["mimo_v"],
+        None,
+        inputs["z"],
+        inputs["D"],
+        inputs["mimo_z"],
+        inputs["angles"],
+        inputs["dA_cs"],
+        inputs["dA_cs_rev"],
+        inputs["dt"],
+        inputs["trap"],
+        inputs["segsum"],
+        chunk_size=chunk_size,
+        rotary_dim_divisor=inputs["rotary_dim_divisor"],
+        dtype=FIXED_DTYPE,
+    )
+
+    q = inputs["q"].cpu()
+    k = inputs["k"].cpu()
+    v = inputs["v"].cpu()
+    q_bias = inputs["q_bias"].cpu()
+    k_bias = inputs["k_bias"].cpu()
+    mimo_v = inputs["mimo_v"].cpu()
+    z = inputs["z"].cpu()
+    mimo_z = inputs["mimo_z"].cpu()
+    angles = inputs["angles"].cpu()
+    dA_cs = inputs["dA_cs"].cpu()
+    dA_cs_rev = inputs["dA_cs_rev"].cpu()
+    dt = inputs["dt"].cpu()
+    trap = inputs["trap"].cpu()
+    D = inputs["D"].cpu()
+
+    out_ref_fp32, _, _ = mamba3_MIMO_chunk_ref(
+        q,
+        k,
+        v,
+        q_bias,
+        k_bias,
+        mimo_v,
+        None,
+        z,
+        mimo_z,
+        angles,
+        dA_cs,
+        dA_cs_rev,
+        dt,
+        trap,
+        D,
+        chunk_size=chunk_size,
+        rotary_dim_divisor=inputs["rotary_dim_divisor"],
+        dtype=torch.float32,
+        return_final_state=False,
+        contract_mimo_out=False,
+    )
+
+    print(f"Test mamba3 mimo fwd: N={n}, P={p}, R={r}, chunk={chunk_size}")
+    out_tilelang = out_tilelang.float().cpu()
+
+    assert_stable_rel(
+        out_tilelang,
+        out_ref_fp32,
+        label="O",
+        cfg=f"N={n}, P={p}, R={r}, chunk={chunk_size}",
+    )
 
 
 if __name__ == "__main__":
-    run_test()
+    os.environ["TILELANG_ASCEND_MODE"] = "Dev"
+    tilelang.cache.clear_cache()
+    # test reduceO
+    test_mimo_fwd_reduceO(case_grid[0], case_grid[1], case_grid[2], case_grid[3])
+    # test Non-reduceO
+    test_mimo_fwd(case_grid[0], case_grid[1], case_grid[2], case_grid[3])
