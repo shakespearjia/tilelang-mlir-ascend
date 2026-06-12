@@ -14,7 +14,6 @@ import tilelang
 import tilelang.language as T
 import os
 
-torch.npu.set_device(0)
 
 FIXED_B = 4
 FIXED_S = 2048
@@ -24,7 +23,7 @@ FIXED_ROTARY_DIM_DIVISOR = 4
 FIXED_DTYPE = torch.bfloat16
 REL_TOL = 0.10
 
-# complement test case grid here
+
 case_grid = [16, 64, 4, 8, 128]
 
 
@@ -53,6 +52,7 @@ def mamba_mimo_fwd(
     nchunks = tilelang.cdiv(S, chunk_size)
     tail_len = S % chunk_size
     fused_chunk_size = chunk_size * R
+    rotary_dim = N // rotary_dim_divisor
 
     O_shape = (B, S, H, P) if reduceO else (B, S, R, H, P)
 
@@ -230,103 +230,63 @@ def mamba_mimo_fwd(
                 T.copy(qk_dot_frag, qk_dot_full_shared)
 
                 # --- Rotary Q + Interchunk Contribution ---
-                q_first_half_frag = T.alloc_fragment(
-                    [chunk_size, R, N // rotary_dim_divisor], accum_dtype
-                )
-                q_second_half_frag = T.alloc_fragment(
-                    [chunk_size, R, N // rotary_dim_divisor], accum_dtype
-                )
-
-                for cs in T.serial(chunk_size):
-                    offset = cs * R
-                    T.copy(
-                        q_shared[offset : offset + R, : N // rotary_dim_divisor],
-                        q_first_half_frag[cs, :, :],
-                    )
-                    T.copy(
-                        q_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                        q_second_half_frag[cs, :, :],
-                    )
-
-                # NOTE: angles are casted to fp32 for numerical stability
-                angles_frag = T.alloc_fragment(
-                    [1, chunk_size, N // rotary_dim_divisor], "float32"
-                )
+                # NOTE: angles are casted to fp32 for numerical stability.
+                angles_frag = T.alloc_shared([chunk_size, 1, rotary_dim], "float32")
                 T.copy(
                     ANGLES[i_b, chunk_start : chunk_start + chunk_size, i_h, :],
                     angles_frag,
                 )
                 angles_frag_cos = T.alloc_fragment(
-                    [1, chunk_size, N // rotary_dim_divisor], "float32"
+                    [chunk_size, 1, rotary_dim], "float32"
                 )
-                T.vcos(angles_frag, angles_frag_cos)
                 angles_frag_sin = T.alloc_fragment(
-                    [1, chunk_size, N // rotary_dim_divisor], "float32"
+                    [chunk_size, 1, rotary_dim], "float32"
                 )
+                angles_frag_cos_r = T.alloc_fragment(
+                    [chunk_size, R, rotary_dim], "float32"
+                )
+                angles_frag_sin_r = T.alloc_fragment(
+                    [chunk_size, R, rotary_dim], "float32"
+                )
+                angles_frag_cos_r_reshaped = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], "float32"
+                )
+                angles_frag_sin_r_reshaped = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], "float32"
+                )
+
+                T.vcos(angles_frag, angles_frag_cos)
                 T.vsin(angles_frag, angles_frag_sin)
+                T.vbrc(angles_frag_cos, angles_frag_cos_r)
+                T.vbrc(angles_frag_sin, angles_frag_sin_r)
+                T.reshape(angles_frag_cos_r, angles_frag_cos_r_reshaped)
+                T.reshape(angles_frag_sin_r, angles_frag_sin_r_reshaped)
 
-                sincos_tmp = T.alloc_shared([1, R, N // rotary_dim_divisor], "float32")
-                sincos_2d = T.alloc_shared([R, N // rotary_dim_divisor], "float32")
-
-                q_shared_tmp = T.alloc_shared(
-                    [1, R, N // rotary_dim_divisor], "float32"
+                q_first_sin = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
+                )
+                q_second_sin = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
+                )
+                q_first_cos = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
+                )
+                q_second_cos = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
                 )
 
-                for cs in T.serial(chunk_size):
-                    offset = cs * R
-                    T.vmul(
-                        angles_frag_cos[0, cs, :],
-                        q_first_half_frag[cs, :, :],
-                        q_shared_tmp,
-                    )
-                    T.copy(
-                        q_shared_tmp,
-                        q_shared[offset : offset + R, : N // rotary_dim_divisor],
-                    )
-                    T.vmul(
-                        angles_frag_sin[0, cs, :],
-                        q_second_half_frag[cs, :, :],
-                        sincos_tmp,
-                    )
-                    T.copy(sincos_tmp, sincos_2d)
-                    T.vsub(
-                        q_shared[offset : offset + R, : N // rotary_dim_divisor],
-                        sincos_2d,
-                        q_shared[offset : offset + R, : N // rotary_dim_divisor],
-                    )
-
-                    T.vmul(
-                        angles_frag_sin[0, cs, :],
-                        q_first_half_frag[cs, :, :],
-                        q_shared_tmp,
-                    )
-                    T.copy(
-                        q_shared_tmp,
-                        q_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                    )
-                    T.vmul(
-                        angles_frag_cos[0, cs, :],
-                        q_second_half_frag[cs, :, :],
-                        sincos_tmp,
-                    )
-                    T.copy(sincos_tmp, sincos_2d)
-                    T.vadd(
-                        q_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                        sincos_2d,
-                        q_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                    )
+                T.copy(q_shared[:, 0:rotary_dim], q_first_sin)
+                T.copy(q_shared[:, N // 2 : N // 2 + rotary_dim], q_second_sin)
+                T.vmul(q_first_sin, angles_frag_cos_r_reshaped, q_first_cos)
+                T.vmul(q_second_sin, angles_frag_cos_r_reshaped, q_second_cos)
+                T.vmul(q_first_sin, angles_frag_sin_r_reshaped, q_first_sin)
+                T.vmul(q_second_sin, angles_frag_sin_r_reshaped, q_second_sin)
+                T.vsub(q_first_cos, q_second_sin, q_shared[:, 0:rotary_dim])
+                T.vadd(
+                    q_first_sin,
+                    q_second_cos,
+                    q_shared[:, N // 2 : N // 2 + rotary_dim],
+                )
 
                 o_mimo_accum_frag = T.alloc_fragment([fused_chunk_size, P], accum_dtype)
                 T.copy(states_frag, states_accum_cast_shared)
@@ -335,92 +295,37 @@ def mamba_mimo_fwd(
                 )
 
                 # --- Rotary K + Trap Scaling + Intrachunk Contribution ---
-                k_first_half_frag = T.alloc_fragment(
-                    [chunk_size, R, N // rotary_dim_divisor], accum_dtype
+                k_first_sin = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
                 )
-                k_second_half_frag = T.alloc_fragment(
-                    [chunk_size, R, N // rotary_dim_divisor], accum_dtype
+                k_second_sin = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
+                )
+                k_first_cos = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
+                )
+                k_second_cos = T.alloc_fragment(
+                    [fused_chunk_size, rotary_dim], accum_dtype
                 )
 
-                for cs in T.serial(chunk_size):
-                    offset = cs * R
-                    T.copy(
-                        k_shared[offset : offset + R, : N // rotary_dim_divisor],
-                        k_first_half_frag[cs, :, :],
-                    )
-                    T.copy(
-                        k_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                        k_second_half_frag[cs, :, :],
-                    )
-
-                k_shared_tmp = T.alloc_shared(
-                    [1, R, N // rotary_dim_divisor], accum_dtype
+                T.copy(k_shared[:, 0:rotary_dim], k_first_sin)
+                T.copy(k_shared[:, N // 2 : N // 2 + rotary_dim], k_second_sin)
+                T.vmul(k_first_sin, angles_frag_cos_r_reshaped, k_first_cos)
+                T.vmul(k_second_sin, angles_frag_cos_r_reshaped, k_second_cos)
+                T.vmul(k_first_sin, angles_frag_sin_r_reshaped, k_first_sin)
+                T.vmul(k_second_sin, angles_frag_sin_r_reshaped, k_second_sin)
+                T.vsub(k_first_cos, k_second_sin, k_shared[:, 0:rotary_dim])
+                T.vadd(
+                    k_first_sin,
+                    k_second_cos,
+                    k_shared[:, N // 2 : N // 2 + rotary_dim],
                 )
-                for cs in T.serial(chunk_size):
-                    offset = cs * R
-                    T.vmul(
-                        angles_frag_cos[0, cs, :],
-                        k_first_half_frag[cs, :, :],
-                        k_shared_tmp,
-                    )
-                    T.copy(
-                        k_shared_tmp,
-                        k_shared[offset : offset + R, : N // rotary_dim_divisor],
-                    )
-                    T.vmul(
-                        angles_frag_sin[0, cs, :],
-                        k_second_half_frag[cs, :, :],
-                        sincos_tmp,
-                    )
-                    T.copy(sincos_tmp, sincos_2d)
-                    T.vsub(
-                        k_shared[offset : offset + R, : N // rotary_dim_divisor],
-                        sincos_2d,
-                        k_shared[offset : offset + R, : N // rotary_dim_divisor],
-                    )
-
-                    T.vmul(
-                        angles_frag_sin[0, cs, :],
-                        k_first_half_frag[cs, :, :],
-                        k_shared_tmp,
-                    )
-                    T.copy(
-                        k_shared_tmp,
-                        k_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                    )
-                    T.vmul(
-                        angles_frag_cos[0, cs, :],
-                        k_second_half_frag[cs, :, :],
-                        sincos_tmp,
-                    )
-                    T.copy(sincos_tmp, sincos_2d)
-                    T.vadd(
-                        k_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                        sincos_2d,
-                        k_shared[
-                            offset : offset + R,
-                            N // 2 : N // 2 + N // rotary_dim_divisor,
-                        ],
-                    )
 
                 if i == nchunks - 1 and return_final_state:
                     seq_boundary = T.min(chunk_start + chunk_size, S) - chunk_start
                     last_step = seq_boundary - 1
-                    # for r, n in T.Parallel(R, N):
-                    #     FINAL_K[i_b, r, i_h, n] = k_shared[last_step * R + r, n]
-                    T.copy(
-                        k_shared[last_step * R : last_step * R + R, :],
-                        FINAL_K[i_b, :, i_h, :],
-                    )
+                    for r, n in T.Parallel(R, N):
+                        FINAL_K[i_b, r, i_h, n] = k_shared[last_step * R + r, n]
 
                 k_trap_scaled_frag = T.alloc_fragment(
                     [fused_chunk_size, N], accum_dtype
@@ -443,7 +348,9 @@ def mamba_mimo_fwd(
                 )
 
                 # Causal mask over chunk steps (include same-step block; qkv subtract below).
-                da_cs__or__exp_da_cs_shared = T.alloc_shared([chunk_size], "float32")
+                da_cs__or__exp_da_cs_shared = T.alloc_shared(
+                    [chunk_size, 1, 1], "float32"
+                )
                 T.copy(
                     DA_CS[i_b, i_h, chunk_start : chunk_start + chunk_size],
                     da_cs__or__exp_da_cs_shared,
@@ -451,32 +358,47 @@ def mamba_mimo_fwd(
                 qk_intrachunk_masked_frag = T.alloc_fragment(
                     [fused_chunk_size, fused_chunk_size], accum_dtype
                 )
-                T.clear(qk_intrachunk_masked_frag)
-                T.vexp(segsum, segsum)
+                qk_intrachunk_frag_reshaped = T.alloc_fragment(
+                    [chunk_size, R, chunk_size, R], accum_dtype
+                )
+                segsum_reshaped = T.alloc_fragment(
+                    [chunk_size, 1, chunk_size, 1], "float32"
+                )
 
-                for csr_i in T.serial(fused_chunk_size):
-                    for csr_j in T.serial(fused_chunk_size):
-                        if (
-                            csr_i // R >= csr_j // R
-                        ):  # This impl directly matches the ref
-                            qk_intrachunk_masked_frag[csr_i, csr_j] = (
-                                qk_intrachunk_frag[csr_i, csr_j]
-                                * segsum[csr_i // R, csr_j // R]
-                            )
+                T.reshape(qk_intrachunk_frag, qk_intrachunk_frag_reshaped)
+                T.reshape(segsum, segsum_reshaped)
+                T.vexp(segsum_reshaped, segsum_reshaped)
+
+                for csr_i in T.serial(chunk_size):
+                    for csr_j in T.serial(chunk_size):
+                        if csr_i < csr_j:
+                            segsum_reshaped[csr_i, 0, csr_j, 0] = 0.0
+
+                T.vmul(
+                    qk_intrachunk_frag_reshaped,
+                    segsum_reshaped,
+                    qk_intrachunk_frag_reshaped,
+                )
+                T.reshape(qk_intrachunk_frag_reshaped, qk_intrachunk_masked_frag)
 
                 # Exponentiate da_cs__or__exp_da_cs_shared so that later usage does not have to:
 
                 T.vexp(da_cs__or__exp_da_cs_shared, da_cs__or__exp_da_cs_shared)
 
-                exp_da_cs_frag = T.alloc_fragment([chunk_size], dtype="float32")
+                exp_da_cs_frag = T.alloc_fragment([chunk_size, 1, 1], dtype="float32")
+                o_mimo_accum_frag_reshaped = T.alloc_fragment(
+                    [chunk_size, R, P], accum_dtype
+                )
+                T.reshape(o_mimo_accum_frag, o_mimo_accum_frag_reshaped)
                 T.copy(da_cs__or__exp_da_cs_shared, exp_da_cs_frag)
 
-                for cs in T.serial(chunk_size):
-                    T.vmul(
-                        o_mimo_accum_frag[cs * R : cs * R + R, :],
-                        exp_da_cs_frag[cs],
-                        o_mimo_accum_frag[cs * R : cs * R + R, :],
-                    )
+                T.vmul(
+                    o_mimo_accum_frag_reshaped,
+                    exp_da_cs_frag,
+                    o_mimo_accum_frag_reshaped,
+                )
+
+                T.reshape(o_mimo_accum_frag_reshaped, o_mimo_accum_frag)
 
                 T.copy(qk_intrachunk_masked_frag, qk_intrachunk_shared)
 
@@ -489,22 +411,25 @@ def mamba_mimo_fwd(
                 T.clear(qkdot_psiv_frag)
 
                 # Apply shifted gamma
-                qk_dot_tmp = T.alloc_shared([R, R], accum_dtype)
-                PsiV_tmp = T.alloc_shared([R, P], accum_dtype)
-                kv_dot_tmp = T.alloc_shared([R, P], accum_dtype)
+                qk_dot_tmp_2d = T.alloc_shared([R, R], accum_dtype)
+                qk_dot_tmp = T.alloc_shared([R, R, 1], accum_dtype)
+                PsiV_tmp = T.alloc_shared([1, R, P], accum_dtype)
+                PsiV_tmp_reshaped = T.alloc_fragment([R, R, P], accum_dtype)
+                kv_dot_tmp = T.alloc_shared([R, 1, P], accum_dtype)
+                kv_dot_tmp_reshaped = T.alloc_fragment([R, P], accum_dtype)
                 for cs in T.serial(chunk_size):
                     T.copy(
                         qk_dot_full_shared[cs * R : cs * R + R, cs * R : cs * R + R],
-                        qk_dot_tmp,
+                        qk_dot_tmp_2d,
                     )
-                    T.copy(PsiV_shared[cs * R : cs * R + R, :], PsiV_tmp)
-                    T.gemm(qk_dot_tmp, PsiV_tmp, kv_dot_tmp, initC=True)
-                    T.copy(kv_dot_tmp, qkdot_psiv_frag[cs, :, :])
-                    T.vmul(
-                        qkdot_psiv_frag[cs, :, :],
-                        shifted_gamma_frag[cs],
-                        qkdot_psiv_frag[cs, :, :],
-                    )
+                    T.reshape(qk_dot_tmp_2d, qk_dot_tmp)
+                    T.copy(PsiV_shared[cs * R : cs * R + R, :], PsiV_tmp[0, :, :])
+                    T.vbrc(PsiV_tmp, PsiV_tmp_reshaped)
+                    T.vmul(qk_dot_tmp, PsiV_tmp_reshaped, PsiV_tmp_reshaped)
+                    T.reduce(PsiV_tmp_reshaped, kv_dot_tmp, dims=1, reduce_mode="sum")
+                    T.vmul(kv_dot_tmp, shifted_gamma_frag[cs], kv_dot_tmp)
+                    T.reshape(kv_dot_tmp, kv_dot_tmp_reshaped)
+                    T.copy(kv_dot_tmp_reshaped, qkdot_psiv_frag[cs, :, :])
 
                 qkdot_psiv_reshaped_frag = T.alloc_fragment(
                     [fused_chunk_size, P], accum_dtype
@@ -513,20 +438,13 @@ def mamba_mimo_fwd(
                 T.vsub(o_mimo_accum_frag, qkdot_psiv_reshaped_frag, o_mimo_accum_frag)
 
                 if hasD:
-                    PsiV_D_frag = T.alloc_fragment([chunk_size, R, P], "float32")
+                    PsiV_D_frag = T.alloc_fragment([fused_chunk_size, P], "float32")
+                    T.copy(PsiV_shared, PsiV_D_frag)
                     d_i_h = D[i_h]
 
-                    for cs in T.serial(chunk_size):
-                        T.copy(
-                            PsiV_shared[cs * R : cs * R + R, :], PsiV_D_frag[cs, :, :]
-                        )
-
                     T.vmul(PsiV_D_frag, d_i_h, PsiV_D_frag)
-                    PsiV_D_reshaped_frag = T.alloc_fragment(
-                        [fused_chunk_size, P], accum_dtype
-                    )
-                    T.reshape(PsiV_D_frag, PsiV_D_reshaped_frag)
-                    T.vadd(o_mimo_accum_frag, PsiV_D_reshaped_frag, o_mimo_accum_frag)
+
+                    T.vadd(o_mimo_accum_frag, PsiV_D_frag, o_mimo_accum_frag)
                 # --- Optional Z Gating + Down-Projection ---
                 if reduceO:
                     lqk_PsiV_reshaped_frag = T.alloc_fragment(
@@ -596,32 +514,25 @@ def mamba_mimo_fwd(
                         T.vmul(z_frag, mimoZ_shared, o_gated)
 
                         T.vtanh(o_gated, o_gated_tanh)
-                        o_gated_mul_tmp = T.alloc_shared(
+                        o_gated_mul_tmp = T.alloc_fragment(
                             [chunk_size, R, P], accum_dtype
                         )
                         T.vmul(o_gated, o_gated_tanh, o_gated_mul_tmp)
                         T.vadd(o_gated, o_gated_mul_tmp, z_expanded_frag)
 
+                        o_mimo_accum_reshaped_frag = T.alloc_fragment(
+                            [chunk_size, R, P], accum_dtype
+                        )
+                        T.reshape(o_mimo_accum_frag, o_mimo_accum_reshaped_frag)
+                        T.vmul(
+                            o_mimo_accum_reshaped_frag,
+                            z_expanded_frag,
+                            o_mimo_accum_reshaped_frag,
+                        )
                         lqk_PsiV_reshaped_shared = T.alloc_shared(
                             [chunk_size, R, P], accum_dtype
                         )
-                        # for cs, r, p in T.Parallel(chunk_size, R, P):
-                        #     lqk_PsiV_reshaped_shared[cs, r, p] = (
-                        #         o_mimo_accum_frag[cs * R + r, p]
-                        #         * z_expanded_frag[cs, r, p]
-                        #     )
-                        accum_frag_tmp = T.alloc_fragment([1, R, P], accum_dtype)
-                        for cs in T.serial(chunk_size):
-                            T.copy(
-                                o_mimo_accum_frag[cs * R : cs * R + R, :],
-                                accum_frag_tmp[0, :, :],
-                            )
-                            T.vmul(
-                                accum_frag_tmp,
-                                z_expanded_frag[cs, :, :],
-                                lqk_PsiV_reshaped_shared[cs, :, :],
-                            )
-
+                        T.copy(o_mimo_accum_reshaped_frag, lqk_PsiV_reshaped_shared)
                         T.copy(
                             lqk_PsiV_reshaped_shared,
                             O[i_b, chunk_start : chunk_start + chunk_size, :, i_h, :],
@@ -630,15 +541,10 @@ def mamba_mimo_fwd(
                         lqk_PsiV_reshaped_shared = T.alloc_shared(
                             [chunk_size, R, P], accum_dtype
                         )
-                        # for cs, r, p in T.Parallel(chunk_size, R, P):
-                        #     lqk_PsiV_reshaped_shared[cs, r, p] = o_mimo_accum_frag[
-                        #         cs * R + r, p
-                        #     ]
-                        for cs in T.serial(chunk_size):
-                            T.copy(
-                                o_mimo_accum_frag[cs * R : cs * R + R, :],
-                                lqk_PsiV_reshaped_shared[cs, :, :],
-                            )
+                        for cs, r, p in T.Parallel(chunk_size, R, P):
+                            lqk_PsiV_reshaped_shared[cs, r, p] = o_mimo_accum_frag[
+                                cs * R + r, p
+                            ]
                         T.copy(
                             lqk_PsiV_reshaped_shared,
                             O[i_b, chunk_start : chunk_start + chunk_size, :, i_h, :],
@@ -1345,8 +1251,10 @@ def test_mimo_fwd(n: int, p: int, r: int, chunk_size: int):
 
 if __name__ == "__main__":
     os.environ["TILELANG_ASCEND_MODE"] = "Dev"
+    torch.npu.set_device(0)
     tilelang.cache.clear_cache()
     # test reduceO
     test_mimo_fwd_reduceO(case_grid[0], case_grid[1], case_grid[2], case_grid[3])
     # test Non-reduceO
     test_mimo_fwd(case_grid[0], case_grid[1], case_grid[2], case_grid[3])
+    print("\033[92mAll check passed.\033[0m")
