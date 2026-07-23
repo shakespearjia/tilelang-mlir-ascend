@@ -26,6 +26,7 @@ def sparse_mqa_fwd(
     accum_dtype=FP32,
     indices_dtype=INT32,
 ):
+    kernel_num = 24
     scale = (1.0 / dim) ** 0.5 if scale is None else scale
     batch_size = T.symbolic("batchSize")
     seq_len = T.symbolic("seqLen")
@@ -47,113 +48,147 @@ def sparse_mqa_fwd(
             (batch_size, seq_len, block_heads, top_k_reserved), accum_dtype
         ),
     ):
-        with T.Kernel(batch_size * seq_len, is_npu=True) as (cid, _):
-            by = cid // seq_len
-            bx = cid % seq_len
+        with T.Kernel(batch_size * kernel_num, is_npu=True) as (kernel_id, _):
+            repeat_num = T.ceildiv(seq_len, kernel_num)
+            by = kernel_id // kernel_num
             value_zero = 0
 
-            q_shared = T.alloc_shared((block_heads, dim), dtype)
-            kv_gather = T.alloc_shared((block_top_k_vec, dim), dtype)
-            kv_shared = T.alloc_shared((block_top_k_cube, dim), dtype)
-            o_shared = T.alloc_shared((block_heads, dim), dtype)
-            acc_s_cast = T.alloc_shared((block_heads, max_top_k), dtype)
-            attn_sink_shared = T.alloc_shared((block_heads, 1), accum_dtype)
+            for i in T.serial(repeat_num):
+                bx = kernel_id % kernel_num + i * kernel_num
+                q_shared = T.alloc_shared((block_heads, dim), dtype)
+                kv_gather = T.alloc_shared((block_top_k_vec, dim), dtype)
+                kv_shared = T.alloc_shared((block_top_k_cube, dim), dtype)
+                o_shared = T.alloc_shared((block_heads, dim), dtype)
+                acc_s_cast = T.alloc_shared((block_heads, max_top_k), dtype)
+                attn_sink_shared = T.alloc_shared((block_heads, 1), accum_dtype)
 
-            idxs = T.alloc_fragment((block_top_k_vec,), indices_dtype)
-            acc_s_block = T.alloc_fragment((block_heads, block_top_k_cube), accum_dtype)
-            acc_s = T.alloc_fragment((block_heads, max_top_k), accum_dtype)
-            acc_o = T.alloc_fragment((block_heads, dim), accum_dtype)
-            scores_max = T.alloc_fragment((block_heads, 1), accum_dtype)
-            scores_sum = T.alloc_fragment((block_heads, 1), accum_dtype)
-            valid_mask = T.alloc_fragment((1, max_top_k), accum_dtype)
-            valid_mask_block = T.alloc_fragment((block_top_k_vec,), accum_dtype)
-
-            for n in T.Pipelined(T.ceildiv(num_heads, block_heads), num_stages=2):
-                T.vbrc(value_zero, acc_o)
-                T.copy(Q[by, bx, n * block_heads, 0], q_shared)
-                if n == 0:
-                    for k in T.Pipelined(
-                        T.ceildiv(top_k_reserved, block_top_k_vec), num_stages=2
+                idxs = T.alloc_fragment((block_top_k_vec,), indices_dtype)
+                acc_s_block = T.alloc_fragment(
+                    (block_heads, block_top_k_cube), accum_dtype
+                )
+                acc_s = T.alloc_fragment((block_heads, max_top_k), accum_dtype)
+                acc_o = T.alloc_fragment((block_heads, dim), accum_dtype)
+                scores_max = T.alloc_fragment((block_heads, 1), accum_dtype)
+                scores_sum = T.alloc_fragment((block_heads, 1), accum_dtype)
+                valid_mask = T.alloc_fragment((1, max_top_k), accum_dtype)
+                valid_mask_block = T.alloc_fragment((block_top_k_vec,), accum_dtype)
+                if bx < seq_len:
+                    for n in T.Pipelined(
+                        T.ceildiv(num_heads, block_heads), num_stages=2
                     ):
-                        real_block_top_k = T.min(
-                            top_k - k * block_top_k_vec, block_top_k_vec
-                        )
-                        real_block_top_k = T.max(real_block_top_k, 0)
-                        T.copy(TopKIndices[by, bx, k * block_top_k_vec], idxs)
-                        T.vbrc(value_zero, valid_mask_block)
-                        T.vbrc(value_zero, kv_gather)
-                        for i in T.serial(real_block_top_k):
-                            cur_idx = idxs[i]
-                            if cur_idx != -1:
-                                valid_mask_block[i] = 1.0
-                                T.copy(
-                                    KV[by, cur_idx, 0], kv_gather[i, 0], size=[1, dim]
+                        T.vbrc(value_zero, acc_o)
+                        T.copy(Q[by, bx, n * block_heads, 0], q_shared)
+                        if n == 0:
+                            for k in T.Pipelined(
+                                T.ceildiv(top_k_reserved, block_top_k_vec), num_stages=2
+                            ):
+                                real_block_top_k = T.min(
+                                    top_k - k * block_top_k_vec, block_top_k_vec
                                 )
+                                real_block_top_k = T.max(real_block_top_k, 0)
+                                T.copy(TopKIndices[by, bx, k * block_top_k_vec], idxs)
+                                T.vbrc(value_zero, valid_mask_block)
+                                T.vbrc(value_zero, kv_gather)
+                                for i in T.serial(real_block_top_k):
+                                    cur_idx = idxs[i]
+                                    if cur_idx != -1:
+                                        valid_mask_block[i] = 1.0
+                                        T.copy(
+                                            KV[by, cur_idx, 0],
+                                            kv_gather[i, 0],
+                                            size=[1, dim],
+                                        )
+                                T.copy(
+                                    valid_mask_block,
+                                    ValidMaskBuffer[by, bx, k * block_top_k_vec],
+                                )
+                                T.copy(
+                                    kv_gather,
+                                    SparseKVBuffer[by, bx, k * block_top_k_vec, 0],
+                                )
+
+                        for k in T.Pipelined(
+                            T.ceildiv(top_k, block_top_k_cube), num_stages=2
+                        ):
+                            T.copy(
+                                SparseKVBuffer[by, bx, k * block_top_k_cube, 0],
+                                kv_shared,
+                            )
+                            T.gemm(
+                                q_shared,
+                                kv_shared,
+                                acc_s_block,
+                                initC=True,
+                                b_transpose=True,
+                            )
+                            T.copy(
+                                acc_s_block,
+                                WorkspaceScore[by, bx, 0, k * block_top_k_cube],
+                            )
+
                         T.copy(
-                            valid_mask_block,
-                            ValidMaskBuffer[by, bx, k * block_top_k_vec],
+                            WorkspaceScore[by, bx, 0, 0],
+                            acc_s,
+                            size=[block_heads, top_k_reserved],
                         )
+                        T.vbrc(value_zero, valid_mask)
                         T.copy(
-                            kv_gather, SparseKVBuffer[by, bx, k * block_top_k_vec, 0]
+                            ValidMaskBuffer[by, bx, 0],
+                            valid_mask[0, 0],
+                            size=[1, top_k_reserved],
                         )
+                        for i, j in T.Parallel(block_heads, max_top_k):
+                            acc_s[i, j] *= scale
+                        # Mask invalid slots to -inf before softmax (matches gpatch).
+                        for i, j in T.Parallel(block_heads, max_top_k):
+                            acc_s[i, j] = T.if_then_else(
+                                valid_mask[0, j] > 0,
+                                acc_s[i, j],
+                                -T.infinity(accum_dtype),
+                            )
+                        T.reduce_max(
+                            acc_s, scores_max, dim=1, size=[block_heads, top_k]
+                        )
+                        for i, j in T.Parallel(block_heads, max_top_k):
+                            acc_s[i, j] = T.exp(acc_s[i, j] - scores_max[i, 0])
+                        T.reduce_sum(
+                            acc_s, scores_sum, dim=1, size=[block_heads, top_k]
+                        )
+                        T.copy(AttnSink[n * block_heads, 0], attn_sink_shared)
+                        for i in T.Parallel(block_heads):
+                            scores_sum[i, 0] += T.exp(
+                                attn_sink_shared[i, 0] - scores_max[i, 0]
+                            )
+                        # lse_log2 = log2(denominator) + scores_max * log2(e), for bwd kernel
+                        lse_buf = T.alloc_fragment((block_heads, 1), accum_dtype)
+                        lse_tmp = T.alloc_fragment((block_heads, 1), accum_dtype)
+                        T.copy(scores_sum, lse_buf)
+                        T.vlog2(lse_buf, lse_buf, lse_tmp)
+                        for i in T.Parallel(block_heads):
+                            lse_buf[i, 0] = lse_buf[i, 0] + scores_max[i, 0] * LOG2E
+                        T.copy(
+                            lse_buf, LSE[by, bx, n * block_heads], size=[1, block_heads]
+                        )
+                        for i, j in T.Parallel(block_heads, max_top_k):
+                            acc_s[i, j] /= scores_sum[i, 0]
+                        T.copy(acc_s, acc_s_cast)
 
-                for k in T.Pipelined(T.ceildiv(top_k, block_top_k_cube), num_stages=2):
-                    T.copy(SparseKVBuffer[by, bx, k * block_top_k_cube, 0], kv_shared)
-                    T.gemm(
-                        q_shared, kv_shared, acc_s_block, initC=True, b_transpose=True
-                    )
-                    T.copy(acc_s_block, WorkspaceScore[by, bx, 0, k * block_top_k_cube])
-
-                T.copy(
-                    WorkspaceScore[by, bx, 0, 0],
-                    acc_s,
-                    size=[block_heads, top_k_reserved],
-                )
-                T.vbrc(value_zero, valid_mask)
-                T.copy(
-                    ValidMaskBuffer[by, bx, 0],
-                    valid_mask[0, 0],
-                    size=[1, top_k_reserved],
-                )
-                for i, j in T.Parallel(block_heads, max_top_k):
-                    acc_s[i, j] *= scale
-                # Mask invalid slots to -inf before softmax (matches gpatch).
-                for i, j in T.Parallel(block_heads, max_top_k):
-                    acc_s[i, j] = T.if_then_else(
-                        valid_mask[0, j] > 0,
-                        acc_s[i, j],
-                        -T.infinity(accum_dtype),
-                    )
-                T.reduce_max(acc_s, scores_max, dim=1, size=[block_heads, top_k])
-                for i, j in T.Parallel(block_heads, max_top_k):
-                    acc_s[i, j] = T.exp(acc_s[i, j] - scores_max[i, 0])
-                T.reduce_sum(acc_s, scores_sum, dim=1, size=[block_heads, top_k])
-                T.copy(AttnSink[n * block_heads, 0], attn_sink_shared)
-                for i in T.Parallel(block_heads):
-                    scores_sum[i, 0] += T.exp(attn_sink_shared[i, 0] - scores_max[i, 0])
-                # lse_log2 = log2(denominator) + scores_max * log2(e), for bwd kernel
-                lse_buf = T.alloc_fragment((block_heads, 1), accum_dtype)
-                lse_tmp = T.alloc_fragment((block_heads, 1), accum_dtype)
-                T.copy(scores_sum, lse_buf)
-                T.vlog2(lse_buf, lse_buf, lse_tmp)
-                for i in T.Parallel(block_heads):
-                    lse_buf[i, 0] = lse_buf[i, 0] + scores_max[i, 0] * LOG2E
-                T.copy(lse_buf, LSE[by, bx, n * block_heads], size=[1, block_heads])
-                for i, j in T.Parallel(block_heads, max_top_k):
-                    acc_s[i, j] /= scores_sum[i, 0]
-                T.copy(acc_s, acc_s_cast)
-
-                for k in T.Pipelined(T.ceildiv(top_k, block_top_k_cube), num_stages=2):
-                    T.copy(SparseKVBuffer[by, bx, k * block_top_k_cube, 0], kv_shared)
-                    T.gemm(
-                        acc_s_cast[0, k * block_top_k_cube],
-                        kv_shared,
-                        acc_o,
-                        initC=False,
-                        size=[block_heads, block_top_k_cube, dim],
-                    )
-                T.copy(acc_o, o_shared)
-                T.copy(o_shared, Output[by, bx, n * block_heads, 0])
+                        for k in T.Pipelined(
+                            T.ceildiv(top_k, block_top_k_cube), num_stages=2
+                        ):
+                            T.copy(
+                                SparseKVBuffer[by, bx, k * block_top_k_cube, 0],
+                                kv_shared,
+                            )
+                            T.gemm(
+                                acc_s_cast[0, k * block_top_k_cube],
+                                kv_shared,
+                                acc_o,
+                                initC=False,
+                                size=[block_heads, block_top_k_cube, dim],
+                            )
+                        T.copy(acc_o, o_shared)
+                        T.copy(o_shared, Output[by, bx, n * block_heads, 0])
 
     return sparseAttn
 
