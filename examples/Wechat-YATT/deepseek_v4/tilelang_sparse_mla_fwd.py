@@ -181,6 +181,9 @@ def sparse_mqa_fwd_interface(
     block_cube = 128
     block_heads = 16 if num_heads > 16 else num_heads
     max_top_k = 256
+    max_logical_cores = 32768
+    max_seq_len_per_launch = max_logical_cores // batch_size
+    assert max_seq_len_per_launch > 0, "batch_size exceeds the logical-core limit"
 
     assert num_heads % block_heads == 0, (
         f"num_heads ({num_heads}) must be divisible by block_heads ({block_heads})"
@@ -199,36 +202,50 @@ def sparse_mqa_fwd_interface(
         )
         os.environ["TILELANG_ASCEND_WORKSPACE_SIZE"] = str(bytes_workspace * 16)
         sparse_mqa_fwd_interface.kernel = sparse_mqa_fwd(
-            block_vec, block_cube, block_heads, num_heads, dim, max_top_k, softmax_scale
+            block_vec,
+            block_cube,
+            block_heads,
+            num_heads,
+            dim,
+            max_top_k=max_top_k,
+            scale=softmax_scale,
         )
         sparse_mqa_fwd_interface.num_heads = num_heads
         sparse_mqa_fwd_interface.dim = dim
         sparse_mqa_fwd_interface.block_heads = block_heads
-    sparse_kv_buffer = torch.empty(
-        (batch_size, seq_len, next_divisible_number(top_k, block_cube), dim),
-        dtype=q.dtype,
-        device=q.device,
-    )
-    valid_mask_buffer = torch.zeros(
-        (batch_size, seq_len, next_divisible_number(top_k, block_cube)),
-        dtype=attn_sink.dtype,
-        device=attn_sink.device,
-    )
-    workspace_score = torch.zeros(
-        (batch_size, seq_len, block_heads, next_divisible_number(top_k, block_cube)),
-        dtype=attn_sink.dtype,
-        device=attn_sink.device,
-    )
-    output, lse = sparse_mqa_fwd_interface.kernel(
-        q.to(torch.bfloat16),
-        kv.contiguous().to(torch.bfloat16),
-        attn_sink,
-        topk_idxs,
-        sparse_kv_buffer,
-        valid_mask_buffer,
-        workspace_score,
-    )
-    return output, lse
+    kv_bf16 = kv.contiguous().to(torch.bfloat16)
+    output_chunks = []
+    lse_chunks = []
+    for seq_start in range(0, seq_len, max_seq_len_per_launch):
+        seq_end = min(seq_start + max_seq_len_per_launch, seq_len)
+        chunk_len = seq_end - seq_start
+        sparse_kv_buffer = torch.empty(
+            (batch_size, chunk_len, next_divisible_number(top_k, block_cube), dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        valid_mask_buffer = torch.zeros(
+            (batch_size, chunk_len, next_divisible_number(top_k, block_cube)),
+            dtype=attn_sink.dtype,
+            device=attn_sink.device,
+        )
+        workspace_score = torch.zeros(
+            (batch_size, chunk_len, block_heads, next_divisible_number(top_k, block_cube)),
+            dtype=attn_sink.dtype,
+            device=attn_sink.device,
+        )
+        output, lse = sparse_mqa_fwd_interface.kernel(
+            q[:, seq_start:seq_end].contiguous().to(torch.bfloat16),
+            kv_bf16,
+            attn_sink,
+            topk_idxs[:, seq_start:seq_end].contiguous(),
+            sparse_kv_buffer,
+            valid_mask_buffer,
+            workspace_score,
+        )
+        output_chunks.append(output)
+        lse_chunks.append(lse)
+    return torch.cat(output_chunks, dim=1), torch.cat(lse_chunks, dim=1)
 
 
 def gather_sparse_kv(kv: torch.Tensor, topk_idxs: torch.Tensor):
@@ -313,33 +330,24 @@ def rand_sparse_attn_input(
     }
 
 
-def generate_and_save_data(case_id, **kwargs):
-    inputs = rand_sparse_attn_input(**kwargs)
-    outputs, lse = sparse_attn_torch(**inputs)
-    torch.save({"inputs": inputs, "outputs": outputs, "lse": lse}, f"case_{case_id}.pt")
-
-
 def generate_data():
-    generate_and_save_data(
-        case_id=0,
+    return rand_sparse_attn_input(
         batch_size=1,
         num_heads=32,
-        seq_len=4096,
+        seq_len=65536,
         seq_len_kv=4096,
         top_k=128,
-        dim=512,
+        dim=128,
     )
 
 
-def run_test():
-    data = torch.load("case_0.pt", map_location=torch.device("npu"))
-    output, lse = sparse_mqa_fwd_interface(**data["inputs"])
-    ref_out, ref_lse = sparse_attn_torch(**data["inputs"])
+def run_test(inputs):
+    output, lse = sparse_mqa_fwd_interface(**inputs)
+    ref_out, ref_lse = sparse_attn_torch(**inputs)
     torch.testing.assert_close(ref_out, output.float(), rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(ref_lse, lse.float(), rtol=1e-2, atol=1e-2)
     print("\033[92mAll check passed.\033[0m")
 
 
 if __name__ == "__main__":
-    generate_data()
-    run_test()
+    run_test(generate_data())
