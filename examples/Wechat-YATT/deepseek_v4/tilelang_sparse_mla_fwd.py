@@ -47,9 +47,8 @@ def sparse_mqa_fwd(
             (batch_size, seq_len, block_heads, top_k_reserved), accum_dtype
         ),
     ):
-        with T.Kernel(batch_size * seq_len, is_npu=True) as (cid, _):
-            by = cid // seq_len
-            bx = cid % seq_len
+        total_queries = batch_size * seq_len
+        with T.Kernel((batch_size * seq_len + 3) // 4, is_npu=True) as (cid, _):
             value_zero = 0
 
             q_shared = T.alloc_shared((block_heads, dim), dtype)
@@ -68,10 +67,17 @@ def sparse_mqa_fwd(
             valid_mask = T.alloc_fragment((1, max_top_k), accum_dtype)
             valid_mask_block = T.alloc_fragment((block_top_k_vec,), accum_dtype)
 
-            for n in T.Pipelined(T.ceildiv(num_heads, block_heads), num_stages=2):
+            for work_id in T.Pipelined(
+                4 * T.ceildiv(num_heads, block_heads), num_stages=2
+            ):
+                query_offset = work_id // T.ceildiv(num_heads, block_heads)
+                head_block = work_id % T.ceildiv(num_heads, block_heads)
+                query_id = T.min(cid * 4 + query_offset, total_queries - 1)
+                by = query_id // seq_len
+                bx = query_id % seq_len
                 T.vbrc(value_zero, acc_o)
-                T.copy(Q[by, bx, n * block_heads, 0], q_shared)
-                if n == 0:
+                T.copy(Q[by, bx, head_block * block_heads, 0], q_shared)
+                if head_block == 0:
                     for k in T.Pipelined(
                         T.ceildiv(top_k_reserved, block_top_k_vec), num_stages=2
                     ):
@@ -128,7 +134,7 @@ def sparse_mqa_fwd(
                 for i, j in T.Parallel(block_heads, max_top_k):
                     acc_s[i, j] = T.exp(acc_s[i, j] - scores_max[i, 0])
                 T.reduce_sum(acc_s, scores_sum, dim=1, size=[block_heads, top_k])
-                T.copy(AttnSink[n * block_heads, 0], attn_sink_shared)
+                T.copy(AttnSink[head_block * block_heads, 0], attn_sink_shared)
                 for i in T.Parallel(block_heads):
                     scores_sum[i, 0] += T.exp(attn_sink_shared[i, 0] - scores_max[i, 0])
                 # lse_log2 = log2(denominator) + scores_max * log2(e), for bwd kernel
@@ -138,7 +144,11 @@ def sparse_mqa_fwd(
                 T.vlog2(lse_buf, lse_buf, lse_tmp)
                 for i in T.Parallel(block_heads):
                     lse_buf[i, 0] = lse_buf[i, 0] + scores_max[i, 0] * LOG2E
-                T.copy(lse_buf, LSE[by, bx, n * block_heads], size=[1, block_heads])
+                T.copy(
+                    lse_buf,
+                    LSE[by, bx, head_block * block_heads],
+                    size=[1, block_heads],
+                )
                 for i, j in T.Parallel(block_heads, max_top_k):
                     acc_s[i, j] /= scores_sum[i, 0]
                 T.copy(acc_s, acc_s_cast)
@@ -153,7 +163,7 @@ def sparse_mqa_fwd(
                         size=[block_heads, block_top_k_cube, dim],
                     )
                 T.copy(acc_o, o_shared)
-                T.copy(o_shared, Output[by, bx, n * block_heads, 0])
+                T.copy(o_shared, Output[by, bx, head_block * block_heads, 0])
 
     return sparseAttn
 
@@ -182,8 +192,12 @@ def sparse_mqa_fwd_interface(
     block_heads = 16 if num_heads > 16 else num_heads
     max_top_k = 256
     max_logical_cores = 32768
-    max_seq_len_per_launch = max_logical_cores // batch_size
-    assert max_seq_len_per_launch > 0, "batch_size exceeds the logical-core limit"
+    queries_per_logical_core = 4
+    max_total_queries = max_logical_cores * queries_per_logical_core
+    assert batch_size * seq_len <= max_total_queries, (
+        f"batch_size * seq_len ({batch_size * seq_len}) must not exceed "
+        f"{max_total_queries}"
+    )
 
     assert num_heads % block_heads == 0, (
         f"num_heads ({num_heads}) must be divisible by block_heads ({block_heads})"
@@ -213,39 +227,31 @@ def sparse_mqa_fwd_interface(
         sparse_mqa_fwd_interface.num_heads = num_heads
         sparse_mqa_fwd_interface.dim = dim
         sparse_mqa_fwd_interface.block_heads = block_heads
-    kv_bf16 = kv.contiguous().to(torch.bfloat16)
-    output_chunks = []
-    lse_chunks = []
-    for seq_start in range(0, seq_len, max_seq_len_per_launch):
-        seq_end = min(seq_start + max_seq_len_per_launch, seq_len)
-        chunk_len = seq_end - seq_start
-        sparse_kv_buffer = torch.empty(
-            (batch_size, chunk_len, next_divisible_number(top_k, block_cube), dim),
-            dtype=q.dtype,
-            device=q.device,
-        )
-        valid_mask_buffer = torch.zeros(
-            (batch_size, chunk_len, next_divisible_number(top_k, block_cube)),
-            dtype=attn_sink.dtype,
-            device=attn_sink.device,
-        )
-        workspace_score = torch.zeros(
-            (batch_size, chunk_len, block_heads, next_divisible_number(top_k, block_cube)),
-            dtype=attn_sink.dtype,
-            device=attn_sink.device,
-        )
-        output, lse = sparse_mqa_fwd_interface.kernel(
-            q[:, seq_start:seq_end].contiguous().to(torch.bfloat16),
-            kv_bf16,
-            attn_sink,
-            topk_idxs[:, seq_start:seq_end].contiguous(),
-            sparse_kv_buffer,
-            valid_mask_buffer,
-            workspace_score,
-        )
-        output_chunks.append(output)
-        lse_chunks.append(lse)
-    return torch.cat(output_chunks, dim=1), torch.cat(lse_chunks, dim=1)
+    sparse_kv_buffer = torch.empty(
+        (batch_size, seq_len, next_divisible_number(top_k, block_cube), dim),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    valid_mask_buffer = torch.zeros(
+        (batch_size, seq_len, next_divisible_number(top_k, block_cube)),
+        dtype=attn_sink.dtype,
+        device=attn_sink.device,
+    )
+    workspace_score = torch.zeros(
+        (batch_size, seq_len, block_heads, next_divisible_number(top_k, block_cube)),
+        dtype=attn_sink.dtype,
+        device=attn_sink.device,
+    )
+    output, lse = sparse_mqa_fwd_interface.kernel(
+        q.to(torch.bfloat16),
+        kv.contiguous().to(torch.bfloat16),
+        attn_sink,
+        topk_idxs,
+        sparse_kv_buffer,
+        valid_mask_buffer,
+        workspace_score,
+    )
+    return output, lse
 
 
 def gather_sparse_kv(kv: torch.Tensor, topk_idxs: torch.Tensor):
